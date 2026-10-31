@@ -1,0 +1,50 @@
+# Keeps the free Supabase project awake.
+# Supabase pauses a free project after 7 days with no activity (e.g. school holidays).
+# This job runs every day, sends one tiny request, and needs no setup:
+# it reads the Supabase URL and public anon key from config.js.
+name: Keep site awake
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # every day at 07:17 UAE time
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: write           # only used once a month (see last step)
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ping Supabase
+        run: |
+          URL="${{ secrets.SUPABASE_URL }}"
+          KEY="${{ secrets.SUPABASE_ANON_KEY }}"
+          if [ -z "$URL" ]; then URL=$(grep -oE 'SUPABASE_URL:[[:space:]]*"[^"]*"' config.js | sed -E 's/.*"([^"]*)"/\1/'); fi
+          if [ -z "$KEY" ]; then KEY=$(grep -oE 'SUPABASE_ANON_KEY:[[:space:]]*"[^"]*"' config.js | sed -E 's/.*"([^"]*)"/\1/'); fi
+          if [ -z "$URL" ] || [ -z "$KEY" ]; then
+            echo "config.js has no Supabase URL or key yet (demo mode). Nothing to ping."; exit 0
+          fi
+          for i in 1 2 3; do
+            CODE=$(curl -s -o out.txt -w "%{http_code}" -X POST "$URL/rest/v1/rpc/ping" \
+              -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{}')
+            echo "Try $i: HTTP $CODE $(cat out.txt)"
+            if [ "$CODE" = "200" ]; then exit 0; fi
+            sleep 60
+          done
+          echo "Supabase did not answer. It may be paused: open supabase.com and press Restore."; exit 1
+
+      # GitHub stops scheduled jobs in repos with no activity for 60 days.
+      # On the 1st of each month this saves a one-line date file so the repo stays active.
+      - name: Monthly heartbeat
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%d)" = "01" ]; then
+            date -u +"Last heartbeat: %Y-%m-%d" > keep-alive.txt
+            git config user.name "keep-alive-bot"
+            git config user.email "keep-alive-bot@users.noreply.github.com"
+            git add keep-alive.txt
+            git commit -m "Monthly keep-alive" && git push
+          fi
