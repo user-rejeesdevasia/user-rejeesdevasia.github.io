@@ -7,8 +7,8 @@ const PRACTICE = window.PRACTICE || {};
 
 let sb = null;
 if (!DEMO) {
-  const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm");
-  sb = createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
+  // Library is hosted with the site (vendor/), so school networks that block CDNs still work.
+  sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
 }
 
 /* ================= helpers ================= */
@@ -91,12 +91,14 @@ const store = {
 };
 
 /* ================= data layer: Supabase ================= */
+const NET_MSG = "Cannot reach the English Learning Lab server. This network may be blocking it. Try mobile data or home Wi-Fi, or ask your school IT to allow the site.";
+const isNet = (e) => /failed to fetch|failed to send a request|networkerror|load failed|retryablefetch|fetch failed/i.test(`${e?.name || ""} ${e?.message || ""}`) || e?.status === 0;
 const must = ({ data, error }) => { if (error) throw new Error(error.message); return data; };
 const SB = {
   async session() { const { data } = await sb.auth.getSession(); return data.session ? this.me() : null; },
   async signIn(u, p) {
     const { error } = await sb.auth.signInWithPassword({ email: `${u.trim().toLowerCase()}@${CFG.LOGIN_DOMAIN}`, password: p });
-    if (error) throw new Error(/banned/i.test(error.message) ? "This account is disabled. Please speak to your teacher." : "That username or password is not correct.");
+    if (error) throw new Error(isNet(error) ? NET_MSG : /banned/i.test(error.message) ? "This account is disabled. Please speak to your teacher." : "That username or password is not correct.");
     return this.me();
   },
   async me() {
@@ -157,7 +159,7 @@ const SB = {
   async feedbackList() { return must(await sb.from("feedback").select("*").order("created_at", { ascending: false })); },
   async joinFn(body) {
     const { data, error } = await sb.functions.invoke("join", { body });
-    if (error) { let m = error.message; try { m = (await error.context.json()).error || m; } catch {} throw new Error(m); }
+    if (error) { if (isNet(error)) throw new Error(NET_MSG); let m = error.message; try { m = (await error.context.json()).error || m; } catch {} throw new Error(m); }
     return data;
   },
   joinInfo(grade) { return this.joinFn({ action: "info", grade }); },
