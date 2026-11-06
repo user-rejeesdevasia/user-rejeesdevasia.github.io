@@ -1,15 +1,9 @@
 // English Learning Lab — portal app
-// Roles: admin, teacher, student. Data lives in Supabase (or in memory in demo mode).
+// Roles: admin, teacher, student. Data lives on the Google Apps Script server (or in memory in demo mode).
 const SA = atob("c3VwZXJhZG1pbg==");
 const CFG = window.HUB_CONFIG;
-const DEMO = !CFG.SUPABASE_URL;
+const DEMO = !CFG.API_URL;
 const PRACTICE = window.PRACTICE || {};
-
-let sb = null;
-if (!DEMO) {
-  // Library is hosted with the site (vendor/), so school networks that block CDNs still work.
-  sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
-}
 
 /* ================= helpers ================= */
 const app = document.getElementById("app");
@@ -90,127 +84,85 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
 
-/* ================= data layer: Supabase ================= */
+/* ================= data layer: Google Apps Script server ================= */
 const NET_MSG = "Cannot reach the English Learning Lab server. This network may be blocking it. Try mobile data or home Wi-Fi, or ask your school IT to allow the site.";
-const isNet = (e) => /failed to fetch|failed to send a request|networkerror|load failed|retryablefetch|fetch failed/i.test(`${e?.name || ""} ${e?.message || ""}`) || e?.status === 0;
-const must = ({ data, error }) => { if (error) throw new Error(error.message); return data; };
-const SB = {
-  async session() { const { data } = await sb.auth.getSession(); return data.session ? this.me() : null; },
-  async signIn(u, p) {
-    const { error } = await sb.auth.signInWithPassword({ email: `${u.trim().toLowerCase()}@${CFG.LOGIN_DOMAIN}`, password: p });
-    if (error) throw new Error(isNet(error) ? NET_MSG : /banned/i.test(error.message) ? "This account is disabled. Please speak to your teacher." : "That username or password is not correct.");
-    return this.me();
+const TOKEN_KEY = "ell-token";
+const token = { get: () => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } },
+  set: (t) => { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch {} } };
+async function call(action, args = {}) {
+  let res;
+  try {
+    // text/plain keeps this a "simple" request (no CORS preflight), which Apps Script needs
+    res = await fetch(CFG.API_URL, { method: "POST", body: JSON.stringify({ action, args, token: token.get() }), redirect: "follow" });
+  } catch { throw new Error(NET_MSG); }
+  let out;
+  try { out = await res.json(); } catch { throw new Error(res.ok ? "The server sent an unexpected reply. Please try again." : NET_MSG); }
+  if (!out.ok) {
+    if (out.auth) { token.set(null); if (S.me) { S.me = null; setTimeout(() => renderLogin(), 0); } }
+    throw new Error(out.error || "Something went wrong. Please try again.");
+  }
+  return out.data;
+}
+const fileArg = (file) => !file ? null : new Promise((ok, bad) => {
+  const r = new FileReader();
+  r.onload = () => ok({ name: file.name, type: file.type || "application/octet-stream", data: String(r.result).split(",")[1] || "" });
+  r.onerror = () => bad(new Error("Could not read that file."));
+  r.readAsDataURL(file);
+});
+const GAS = {
+  async session() { if (!token.get()) return null; try { return await call("me"); } catch { return null; } },
+  async signIn(u, p) { const r = await call("signIn", { username: u.trim().toLowerCase(), password: p }); token.set(r.token); return r.me; },
+  async signOut() { try { await call("signOut"); } catch {} token.set(null); },
+  classes: () => call("classes"),
+  studentCounts: () => call("studentCounts"),
+  createClass: (c) => call("createClass", { c }),
+  updateClass: (id, patch) => call("updateClass", { id, patch }),
+  deleteClass: (id) => call("deleteClass", { id }),
+  students: (cid) => call("students", { cid }),
+  staff: () => call("staff"),
+  createStudents: (class_id, students) => call("createStudents", { class_id, students }),
+  addExistingStudent: (username, class_id) => call("addExistingStudent", { username, class_id }),
+  createStaff: (t) => call("createStaff", t),
+  resetPasswords: (items) => call("resetPasswords", { items: items.map((i) => ({ id: i.id, password: i.password })) }),
+  setDisabled: (ids, disabled) => call("setDisabled", { ids, disabled }),
+  deleteUsers: (ids) => call("deleteUsers", { ids }),
+  setRole: (id, role) => call("setRole", { id, role }),
+  changeOwnPassword: (current, next) => call("changeOwnPassword", { current, next }),
+  lessons: () => call("lessons"),
+  async createLesson(l, file, classIds, teacherIds) { return call("createLesson", { l, file: await fileArg(file), classIds, teacherIds }); },
+  deleteLesson: (l) => call("deleteLesson", { id: l.id }),
+  customList: () => call("customList"),
+  saveCustom: (row) => call("saveCustom", { row }),
+  deleteCustom: (id) => call("deleteCustom", { id }),
+  feedbackList: () => call("feedbackList"),
+  joinInfo: (grade) => call("joinInfo", { grade }),
+  joinSuggest: (grade, full_name) => call("joinSuggest", { grade, full_name }),
+  joinRegister: (grade, r) => call("joinRegister", { grade, ...r }),
+  joinSessions: () => call("joinSessions"),
+  setJoinSession: (grade, open) => call("setJoinSession", { grade, open }),
+  sendFeedback: (f) => call("sendFeedback", { f }),
+  updateFeedback: (id, patch) => call("updateFeedback", { id, patch }),
+  moveStudent: (id, class_id) => call("moveStudent", { id, class_id }),
+  assignments: (cid) => call("assignments", { cid }),
+  async createAssignment(a, file) { return call("createAssignment", { a, file: await fileArg(file) }); },
+  deleteAssignment: (a) => call("deleteAssignment", { id: a.id }),
+  classSubmissions: (cid) => call("classSubmissions", { cid }),
+  mySubmissions: () => call("mySubmissions"),
+  async submit(me, a, file, note) { return call("submit", { assignment_id: a.id, file: await fileArg(file), note }); },
+  grade: (id, score, feedback) => call("grade", { id, score, feedback }),
+  async fileUrl(bucket, path) {
+    const f = await call("file", { bucket, path });
+    const bin = atob(f.data), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return URL.createObjectURL(new Blob([bytes], { type: f.type || "application/octet-stream" }));
   },
-  async me() {
-    const { data: { user } } = await sb.auth.getUser();
-    if (!user) return null;
-    const p = must(await sb.from("profiles").select("*").eq("id", user.id).single());
-    sb.rpc("touch_last_seen").then(() => {});
-    return p;
-  },
-  async signOut() { await sb.auth.signOut(); },
-  async classes() { return must(await sb.from("classes").select("*").order("grade").order("track").order("section")); },
-  async studentCounts() {
-    const rows = must(await sb.from("profiles").select("class_id").eq("role", "student"));
-    const m = {}; rows.forEach((r) => { if (r.class_id) m[r.class_id] = (m[r.class_id] || 0) + 1; }); return m;
-  },
-  async createClass(c) { return must(await sb.from("classes").insert(c).select().single()); },
-  async updateClass(id, patch) { return must(await sb.from("classes").update(patch).eq("id", id)); },
-  async deleteClass(id) { return must(await sb.from("classes").delete().eq("id", id)); },
-  async students(cid) { return must(await sb.from("profiles").select("*").eq("class_id", cid).eq("role", "student").order("full_name")); },
-  async staff() { return must(await sb.from("profiles").select("*").in("role", ["teacher", "admin", SA]).order("full_name")).filter((p) => p.role !== SA || S.me?.role === SA); },
-  async fn(body) {
-    const { data, error } = await sb.functions.invoke("admin-users", { body });
-    if (error) { let m = error.message; try { m = (await error.context.json()).error || m; } catch {} throw new Error(m); }
-    return data;
-  },
-  createStudents(class_id, students) { return this.fn({ action: "create_students", class_id, students }); },
-  addExistingStudent(username, class_id) { return this.fn({ action: "add_existing_student", username, class_id }); },
-  createStaff(t) { return this.fn({ action: "create_staff", ...t }); },
-  resetPasswords(items) { return this.fn({ action: "reset_passwords", items: items.map((i) => ({ user_id: i.id, password: i.password })) }); },
-  setDisabled(ids, disabled) { return this.fn({ action: "set_disabled", user_ids: ids, disabled }); },
-  deleteUsers(ids) { return this.fn({ action: "delete_users", user_ids: ids }); },
-  setRole(id, role) { return this.fn({ action: "set_role", user_id: id, role }); },
-  async changeOwnPassword(current, next) {
-    const { error: e1 } = await sb.auth.signInWithPassword({ email: `${S.me.username}@${CFG.LOGIN_DOMAIN}`, password: current });
-    if (e1) throw new Error("Your current password is not correct.");
-    const { error } = await sb.auth.updateUser({ password: next });
-    if (error) throw new Error(error.message);
-  },
-  async lessons() { return must(await sb.from("lessons").select("*, lesson_targets(class_id,teacher_id)").order("created_at", { ascending: false })); },
-  async createLesson(l, file, classIds, teacherIds) {
-    const row = must(await sb.from("lessons").insert(l).select().single());
-    if (file) {
-      const path = `${row.id}/${Date.now()}-${safeName(file.name)}`;
-      must(await sb.storage.from("lessons").upload(path, file));
-      must(await sb.from("lessons").update({ file_path: path, file_name: file.name }).eq("id", row.id));
-    }
-    const targets = [...classIds.map((c) => ({ lesson_id: row.id, class_id: c })), ...teacherIds.map((t) => ({ lesson_id: row.id, teacher_id: t }))];
-    if (targets.length) must(await sb.from("lesson_targets").insert(targets));
-  },
-  async deleteLesson(l) { if (l.file_path) await sb.storage.from("lessons").remove([l.file_path]); must(await sb.from("lessons").delete().eq("id", l.id)); },
-  async customList() { return must(await sb.from("custom_content").select("*").order("updated_at", { ascending: false })); },
-  async saveCustom(row) {
-    const { id, ...r } = row;
-    return id ? must(await sb.from("custom_content").update(r).eq("id", id).select().single())
-      : must(await sb.from("custom_content").insert(r).select().single());
-  },
-  async deleteCustom(id) { must(await sb.from("custom_content").delete().eq("id", id)); },
-  async feedbackList() { return must(await sb.from("feedback").select("*").order("created_at", { ascending: false })); },
-  async joinFn(body) {
-    const { data, error } = await sb.functions.invoke("join", { body });
-    if (error) { if (isNet(error)) throw new Error(NET_MSG); let m = error.message; try { m = (await error.context.json()).error || m; } catch {} throw new Error(m); }
-    return data;
-  },
-  joinInfo(grade) { return this.joinFn({ action: "info", grade }); },
-  joinSuggest(grade, full_name) { return this.joinFn({ action: "suggest", grade, full_name }); },
-  joinRegister(grade, r) { return this.joinFn({ action: "register", grade, ...r }); },
-  async joinSessions() { return must(await sb.from("join_sessions").select("*")); },
-  async setJoinSession(grade, open) { must(await sb.from("join_sessions").upsert({ grade, open }, { onConflict: "grade" })); },
-  async sendFeedback(f) { must(await sb.from("feedback").insert(f)); },
-  async updateFeedback(id, patch) { must(await sb.from("feedback").update(patch).eq("id", id)); },
-  async moveStudent(id, class_id) { return must(await sb.from("profiles").update({ class_id }).eq("id", id)); },
-  async assignments(cid) { return must(await sb.from("assignments").select("*").eq("class_id", cid).order("created_at", { ascending: false })); },
-  async createAssignment(a, file) {
-    if (file) {
-      a.file_path = `${a.class_id}/${Date.now()}-${safeName(file.name)}`; a.file_name = file.name;
-      must(await sb.storage.from("assignments").upload(a.file_path, file));
-    }
-    return must(await sb.from("assignments").insert(a).select().single());
-  },
-  async deleteAssignment(a) {
-    if (a.file_path) await sb.storage.from("assignments").remove([a.file_path]);
-    return must(await sb.from("assignments").delete().eq("id", a.id));
-  },
-  async classSubmissions(cid) {
-    return must(await sb.from("submissions").select("*, assignments!inner(class_id)").eq("assignments.class_id", cid));
-  },
-  async mySubmissions(me) { return must(await sb.from("submissions").select("*").eq("student_id", me.id)); },
-  async submit(me, a, file, note, existing) {
-    let file_path = existing?.file_path || null, file_name = existing?.file_name || null;
-    if (file) {
-      file_path = `${me.class_id}/${me.id}/${a.id}/${Date.now()}-${safeName(file.name)}`; file_name = file.name;
-      must(await sb.storage.from("submissions").upload(file_path, file));
-      if (existing?.file_path) await sb.storage.from("submissions").remove([existing.file_path]);
-    }
-    return must(await sb.from("submissions").upsert(
-      { assignment_id: a.id, student_id: me.id, note, file_path, file_name, submitted_at: new Date().toISOString() },
-      { onConflict: "assignment_id,student_id" }));
-  },
-  async grade(id, score, feedback) {
-    return must(await sb.from("submissions").update({ score, feedback, graded_at: new Date().toISOString() }).eq("id", id));
-  },
-  async fileUrl(bucket, path) { return must(await sb.storage.from(bucket).createSignedUrl(path, 3600)).signedUrl; },
-  async savePractice(r) { return must(await sb.from("practice_results").insert(r)); },
-  async classPractice(cid) {
-    return must(await sb.from("practice_results").select("*, profiles!inner(class_id)").eq("profiles.class_id", cid)
-      .order("created_at", { ascending: false }).limit(1000));
-  },
-  async myPractice(me) { return must(await sb.from("practice_results").select("*").eq("student_id", me.id).order("created_at", { ascending: false })); },
-  async allAssignments() { return must(await sb.from("assignments").select("*")); },
-  async allSubmissions() { return must(await sb.from("submissions").select("id,assignment_id,student_id,submitted_at,graded_at")); },
-  async allStudents() { return must(await sb.from("profiles").select("id,full_name,class_id,last_seen_at,disabled").eq("role", "student")); },
-  async recentPractice(since) { return must(await sb.from("practice_results").select("student_id,created_at").gte("created_at", since)); },
+  savePractice: (r) => call("savePractice", { r }),
+  classPractice: (cid) => call("classPractice", { cid }),
+  myPractice: () => call("myPractice"),
+  allAssignments: () => call("allAssignments"),
+  allSubmissions: () => call("allSubmissions"),
+  allStudents: () => call("allStudents"),
+  recentPractice: (since) => call("recentPractice", { since }),
 };
 
 /* ================= data layer: demo (in memory) ================= */
@@ -453,7 +405,7 @@ const DEMOAPI = {
   async allStudents() { const ids = new Set((await this.classes()).map((c) => c.id)); return DB.users.filter((u) => u.role === "student" && ids.has(u.class_id)); },
   async recentPractice(since) { const ids = new Set((await this.allStudents()).map((u) => u.id)); return DB.practice.filter((p) => ids.has(p.student_id) && p.created_at >= since); },
 };
-const API = DEMO ? DEMOAPI : SB;
+const API = DEMO ? DEMOAPI : GAS;
 
 /* Grades kept in the system but not shown (archived).
    Change by adding HIDDEN_GRADES: [9, 10] (or []) to config.js. */
@@ -567,7 +519,7 @@ const navItem = (act, attrs, label, ic, cur) =>
 function frame({ nav, title, crumb }) {
   const roleName = { [SA]: "Full access", admin: "Admin", teacher: "Class teacher", student: "Student" }[S.me.role];
   const staff = S.me.role !== "student";
-  app.innerHTML = `${DEMO ? `<div class="demo-banner"><b>Demo mode</b> · sample data only, nothing is saved. Add your Supabase details in config.js to go live.</div>` : ""}
+  app.innerHTML = `${DEMO ? `<div class="demo-banner"><b>Demo mode</b> · sample data only, nothing is saved. Add your server address (API_URL) in config.js to go live.</div>` : ""}
   <div class="shell">
     <aside class="side">
       <div class="brand"><span class="logo">E</span><span>Teacher REJEES DEVASIA<small>English Learning Lab</small></span></div>
