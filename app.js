@@ -95,7 +95,14 @@ async function post(body) {
     // text/plain keeps this a "simple" request (no CORS preflight), which Apps Script needs
     res = await fetch(CFG.API_URL, { method: "POST", body: JSON.stringify({ ...body, token: token.get() }), redirect: "follow" });
   } catch { throw new Error(NET_MSG); }
-  try { return await res.json(); } catch { throw new Error(res.ok ? "The server sent an unexpected reply. Please try again." : NET_MSG); }
+  let out;
+  try { out = await res.json(); } catch { throw new Error(res.ok ? "The server sent an unexpected reply. Please try again." : NET_MSG); }
+  if (out && out.boot) useBoot(out.boot);
+  return out;
+}
+function useBoot(list) {               // fresh data for every page, sent along with a reply
+  memClear(); mem.bootAt = Date.now();
+  list.forEach((x) => memPut(memKey(x.action, x.args), x.data));
 }
 function settle(out, ok, bad) {
   if (out.ok) return ok(out.data);
@@ -104,8 +111,43 @@ function settle(out, ok, bad) {
 }
 // Questions asked at the same moment travel to the server together in one trip.
 let queue = [], queued = false;
-const ALONE = ["signIn", "signOut", "joinRegister"];
+const ALONE = ["signIn", "signOut", "joinRegister", "bootstrap"];
+/* ---- memory copy: pages open from here instantly; the server is asked again in the background ---- */
+const READS = ["classes", "studentCounts", "students", "staff", "lessons", "customList", "feedbackList", "joinSessions", "assignments",
+  "classSubmissions", "mySubmissions", "classPractice", "myPractice", "allAssignments", "allSubmissions", "allStudents", "recentPractice"];
+const NOT_WRITES = [...READS, "me", "joinInfo", "joinSuggest", "file", "bootstrap", "ping"];
+const FRESH_MS = 30000;
+const mem = { gen: 0, map: new Map(), bootAt: 0 };
+const memKey = (action, args) => action === "recentPractice" ? action : action + ":" + JSON.stringify(args || {});
+function memSave() { try { sessionStorage.setItem("ell-mem", JSON.stringify({ tok: token.get(), entries: [...mem.map] })); } catch {} }
+function memLoad() { try { const m = JSON.parse(sessionStorage.getItem("ell-mem") || "null"); if (m && m.tok === token.get()) mem.map = new Map(m.entries.filter(([, v]) => Date.now() - v.t < 120000)); } catch {} }
+function memClear() { mem.gen++; mem.map.clear(); try { sessionStorage.removeItem("ell-mem"); } catch {} }
+const clone = (x) => (x == null ? x : JSON.parse(JSON.stringify(x)));
+let memTimer = null;
+const memPut = (k, data) => { mem.map.set(k, { t: Date.now(), data }); clearTimeout(memTimer); memTimer = setTimeout(memSave, 400); };
+async function bootstrap() {           // one trip that fills the memory copy for every page
+  const gen = mem.gen;
+  try {
+    const list = await callRaw("bootstrap");
+    if (gen !== mem.gen) return;
+    list.forEach((x) => memPut(memKey(x.action, x.args), x.data));
+  } catch {}
+}
 function call(action, args = {}) {
+  if (READS.includes(action)) {
+    const k = memKey(action, args), hit = mem.map.get(k);
+    if (hit) {
+      if (Date.now() - hit.t > FRESH_MS) { const gen = mem.gen; callRaw(action, args).then((d) => { if (gen === mem.gen) memPut(k, d); }).catch(() => {}); }
+      return Promise.resolve(clone(hit.data));
+    }
+    const gen = mem.gen;
+    return callRaw(action, args).then((d) => { if (gen === mem.gen) memPut(k, d); return clone(d); });
+  }
+  if (NOT_WRITES.includes(action)) return callRaw(action, args);
+  // a change: forget the memory copy so every page shows the new data, then refill it in the background
+  return callRaw(action, args).then((d) => { if (Date.now() - mem.bootAt > 3000) { memClear(); if (S.me) setTimeout(bootstrap, 0); } return d; });
+}
+function callRaw(action, args = {}) {
   return new Promise((ok, bad) => {
     if (ALONE.includes(action)) return post({ action, args }).then((out) => settle(out, ok, bad), bad);
     queue.push({ action, args, ok, bad });
@@ -128,9 +170,15 @@ const fileArg = (file) => !file ? null : new Promise((ok, bad) => {
   r.readAsDataURL(file);
 });
 const GAS = {
-  async session() { if (!token.get()) return null; try { return await call("me"); } catch { return null; } },
-  async signIn(u, p) { const r = await call("signIn", { username: u.trim().toLowerCase(), password: p }); token.set(r.token); return r.me; },
-  async signOut() { try { await call("signOut"); } catch {} token.set(null); },
+  async session() { if (!token.get()) return null; memLoad(); try { return await call("me"); } catch { return null; } },
+  async signIn(u, p) {
+    memClear();
+    const r = await call("signIn", { username: u.trim().toLowerCase(), password: p });
+    token.set(r.token); if (r.boot) useBoot(r.boot);
+    return r.me;
+  },
+  async signOut() { memClear(); try { await call("signOut"); } catch {} token.set(null); },
+  bootstrap,
   classes: () => call("classes"),
   studentCounts: () => call("studentCounts"),
   createClass: (c) => call("createClass", { c }),
@@ -478,6 +526,7 @@ async function refreshToMark() {
   try { S.toMark = (await API.allSubmissions()).filter((s) => !s.graded_at).length; } catch { S.toMark = 0; }
 }
 async function enter() {
+  if (API.bootstrap && !mem.map.size) await API.bootstrap();
   S.classes = await loadClasses();
   if (S.me.role === "student") return renderStudent();
   S.counts = await API.studentCounts();
