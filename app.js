@@ -89,19 +89,37 @@ const NET_MSG = "Cannot reach the English Learning Lab server. This network may 
 const TOKEN_KEY = "ell-token";
 const token = { get: () => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } },
   set: (t) => { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch {} } };
-async function call(action, args = {}) {
+async function post(body) {
   let res;
   try {
     // text/plain keeps this a "simple" request (no CORS preflight), which Apps Script needs
-    res = await fetch(CFG.API_URL, { method: "POST", body: JSON.stringify({ action, args, token: token.get() }), redirect: "follow" });
+    res = await fetch(CFG.API_URL, { method: "POST", body: JSON.stringify({ ...body, token: token.get() }), redirect: "follow" });
   } catch { throw new Error(NET_MSG); }
-  let out;
-  try { out = await res.json(); } catch { throw new Error(res.ok ? "The server sent an unexpected reply. Please try again." : NET_MSG); }
-  if (!out.ok) {
-    if (out.auth) { token.set(null); if (S.me) { S.me = null; setTimeout(() => renderLogin(), 0); } }
-    throw new Error(out.error || "Something went wrong. Please try again.");
-  }
-  return out.data;
+  try { return await res.json(); } catch { throw new Error(res.ok ? "The server sent an unexpected reply. Please try again." : NET_MSG); }
+}
+function settle(out, ok, bad) {
+  if (out.ok) return ok(out.data);
+  if (out.auth) { token.set(null); if (S.me) { S.me = null; setTimeout(() => renderLogin(), 0); } }
+  bad(new Error(out.error || "Something went wrong. Please try again."));
+}
+// Questions asked at the same moment travel to the server together in one trip.
+let queue = [], queued = false;
+const ALONE = ["signIn", "signOut", "joinRegister"];
+function call(action, args = {}) {
+  return new Promise((ok, bad) => {
+    if (ALONE.includes(action)) return post({ action, args }).then((out) => settle(out, ok, bad), bad);
+    queue.push({ action, args, ok, bad });
+    if (!queued) { queued = true; setTimeout(flushQueue, 0); }
+  });
+}
+async function flushQueue() {
+  const items = queue; queue = []; queued = false;
+  if (items.length === 1) { const it = items[0]; return post({ action: it.action, args: it.args }).then((out) => settle(out, it.ok, it.bad), it.bad); }
+  try {
+    const out = await post({ action: "batch", calls: items.map((it) => ({ action: it.action, args: it.args })) });
+    if (!out.ok) return items.forEach((it) => settle(out, it.ok, it.bad));
+    items.forEach((it, i) => settle(out.data[i] || { ok: false, error: "No reply." }, it.ok, it.bad));
+  } catch (e) { items.forEach((it) => it.bad(e)); }
 }
 const fileArg = (file) => !file ? null : new Promise((ok, bad) => {
   const r = new FileReader();
